@@ -44,11 +44,68 @@ Eres un Ingeniero de Automatización RPA Senior con 20 años de experiencia cons
 - **SmartBot**: `AppData` resuelve cada campo según el ambiente; registrar/validar **localizadores por plataforma y ambiente** con la clave que usan las vistas (`ELEMENTS.md`).
 - **FileNet / servicios HTTP**: cliente con `x-api-key`, timeouts y manejo de error explícito.
 
+### El frontend de automatización (SmartBot — `autobol-automation-frontend`)
+
+El bot que escribes no se opera solo: se registra, configura y ejecuta desde el frontend corporativo **SmartBot**, una SPA **Angular 14 + Node 16** (Nebular/PrimeNG, tech-block-lib de Seguros Bolívar) que es el panel de control de toda la automatización. Entender su modelo evita que diseñes un bot que luego no se pueda cablear ni disparar desde la plataforma.
+
+- **Jerarquía de datos**: `Platform` → `Project` → `Suite` → `Cases`. El **bot** que construyes corresponde a una **Suite** (su `pipeline_name`, `gitRepo`, `gitBranch`, `suiteFile` y `botName` son los que terminan en la ejecución). Los **casos** (`Cases`) son los registros/datos que la suite procesa; se seleccionan en el frontend para decidir qué subconjunto ejecutar (`testsToExecute`/`casesToRun`).
+- **Servicios Angular clave** (en `src/app/@core/_services/`):
+  - `suites.service.ts` — CRUD de suites.
+  - `execution-config.service.ts` — configuración de ejecución por suite + payload + disparo n8n.
+  - `jenkins.service.ts` / `jenkins-status.service.ts` — disparo y consulta de estado vía Jenkins.
+  - `suite-cases.service.ts`, `cases.service.ts`, `elements.service.ts`, `enviorenments.service.ts`, `infrastructure-service.service.ts` — casos, localizadores, ambientes e infraestructura.
+  - `api-routes.ts` — todas las URLs del gateway de métricas (`autobol-automation-metricas-ms`).
+- **Rutas de API relevantes** (header `type-scope: metrics`; el `JwtInterceptor` adjunta el token de métricas):
+  - Suites: `POST/GET/PUT /suites/`, `GET /suites/{id}`, obsoletar `PUT /suites/lowcode/obsolete/{id}`.
+  - Config de ejecución: base `/api-metrics/v1/execution-config` → `GET/PUT /capabilities`, `GET/PUT /suite/{suiteId}`, `GET /payload/{suiteId}`, `POST /execute/{suiteId}`.
+  - Jenkins: `POST /jenkins/execute`, `POST /jenkins/status`.
+
+#### Crear o actualizar una suite (bot) desde el frontend
+1. **Alta/edición de la suite** (`SuitesService`): `saveSuite(body)` → `POST /suites/`; `updateSuite(id, body)` → `PUT /suites/{id}`. El `body` incluye los datos del bot (`gitRepo`, `gitBranch`, `suiteFile`, `botName`, `pipeline_name`, plataforma/proyecto/ambiente). Para retirar una suite: `changeSuiteBotObsoleteState(id, true)`.
+2. **Configuración de ejecución por suite** (`ExecutionConfigService.saveSuiteConfig`): `PUT /execution-config/suite/{suiteId}` con `SuiteExecutionConfigRequest` = `{ infrastructureName, botConfig, secretsConfig, suiteEnvVars }`. Aquí se define en qué infraestructura corre, los parámetros del bot, el mapeo de secretos y las variables de entorno de esa suite. Se recupera con `getSuiteConfig(suiteId)`.
+3. **Capabilities** (globales): `GET/PUT /execution-config/capabilities` definen las capacidades/infra disponibles que la suite referencia por `infrastructureName`.
+4. **Casos y localizadores**: los casos se gestionan con `suite-cases.service`/`cases.service`; los **localizadores** que tus Page Objects referencian por clave se registran por plataforma y ambiente vía `elements.service` (esto es el equivalente operativo del `ELEMENTS.md`).
+
+#### Ejecutar una suite desde el frontend
+El disparo se hace desde la UI (p. ej. `dialog-execution-suite.component`, `cases-manager.component`) por **dos vías** según cómo esté configurada la suite:
+- **Jenkins** (`JenkinsService.clickExecuteSuit` → `setExecutionJenkins`): `POST /jenkins/execute` con `{ jobName: suite.pipeline_name, userEmail, nameDriver, testsToExecute }`. El estado se consulta con `JenkinsStatusService` → `POST /jenkins/status` (lista de `pipeline_name`), que hace polling y devuelve `ExecutionStatus[]`.
+- **Orquestador n8n** (`ExecutionConfigService.executeSuite`): `POST /execution-config/execute/{suiteId}`. El **backend** (no el frontend) arma el `ExecutionPayload` a partir de la config de la suite y hace el `POST` al **webhook de n8n** con **Basic Auth del lado servidor** (el frontend nunca ve el secreto del webhook). Se puede previsualizar el payload con `GET /execution-config/payload/{suiteId}`.
+
+#### Contrato del webhook n8n (`ExecutionPayload`)
+Es el contrato que n8n recibe para orquestar la corrida; conocerlo te dice qué debe exponer tu bot y qué debe quedar configurado en la suite:
+```
+parameterStore   → Record<string,any>  (parámetros resueltos de Parameter Store)
+infrastructure   → Record<string,any>  (infra donde corre el bot)
+bot              → { type, gitRepo, gitBranch, suiteFile, name, fileSubstitution }
+notifications    → Record<string,any>  (destinos/condiciones de notificación)
+secrets          → { names: string[], mapping: Record<string,string> }  (por nombre, nunca valores)
+envVars          → Record<string,any>  (variables de entorno de la ejecución)
+```
+Implicaciones para el bot que construyes: el `suiteFile` del payload debe apuntar a tu `suite.xml`; `gitRepo`/`gitBranch` al repo/rama donde vive el robot; los **secretos viajan por nombre** y se resuelven en infraestructura (coherente con "la configuración y los secretos van fuera del código"); `fileSubstitution` permite inyectar/reemplazar archivos (p. ej. `credentials.json`) en el ambiente de ejecución.
+
+#### El backend de métricas (`autobol-automation-metricas-ms`)
+
+Es el **microservicio Spring Boot (Java)** que está detrás del frontend: expone el gateway que el front consume con `type-scope: metrics` y es **quien realmente arma el payload y dispara n8n/Jenkins** (el front nunca ve webhooks ni credenciales de orquestación). Entenderlo te dice qué debe quedar configurado para que una ejecución salga bien.
+
+- **`ExecutionConfigController`** (`web/controller/`, ruta `/api-metrics/v1/execution-config`):
+  - `GET/PUT /capabilities` → `CapabilitiesService` (config global: infra web/desktop, `parameterStore`, `notifications`, `envVars` globales). `PUT` responde 200 si existía o 201 si se creó.
+  - `GET/PUT /suite/{suiteId}` → `SuiteExecutionConfigService` (config por suite: `infrastructureName`, `botConfig`, `secretsConfig`, `suiteEnvVars`).
+  - `GET /payload/{suiteId}` → previsualiza el `ExecutionPayloadDto`.
+  - `POST /execute/{suiteId}` → arma el payload y lo postea a n8n; responde `202 Accepted`.
+- **`PayloadBuilderService.buildPayload(suiteId)`** (`domain/service/executionconfig/`) combina **Capabilities (global) + SuiteExecutionConfig (por suite)**:
+  - **Valida**: la suite debe existir en `AUT_SUITE` (si no, **404**); debe tener config de ejecución (**404**); deben existir Capabilities activas (**422**). Si tu bot "no ejecuta" desde el front, revisa estos tres antes que el código del robot.
+  - `bot.type` se resuelve por infraestructura: `desktop` si `infrastructureName` es la de desktop, si no `web`. `infrastructure` se toma de `infrastructureDesktop`/`infrastructureWeb` de Capabilities.
+  - `bot` se arma desde `botConfig`: `gitRepo`, `gitBranch`, `suiteFile`, `name` y `fileSubstitution` (si es un mapa).
+  - `envVars` = merge de **globales + de la suite** con **prioridad de la suite**, excluyendo claves con prefijo `parameterStore_`.
+  - `secrets` = `{ names, mapping }` filtrando nombres vacíos; vacío → `{names:[], mapping:{}}`.
+- **`N8nWebhookClient.triggerExecution(payload)`** (OkHttp): postea el JSON a `n8n.webhook.url` con header `Authorization` desde `n8n.webhook.auth` — acepta `Basic ...`/`Bearer ...` tal cual, o `user:pass` que codifica en Base64. **URL y auth salen de configuración externa / variables de entorno, nunca hardcodeadas.** Timeouts 10s/30s/30s; si la respuesta no es 2xx o hay error de red lanza `CustomException` (`502 BAD_GATEWAY`) con mensaje genérico (sin filtrar detalles internos).
+- **Jenkins** (`JenkinsController` `/jenkins` + `JenkinsService`): `POST /jenkins/execute` invoca el job de Jenkins vía `.../job/<pipeline>/buildWithParameters?EMAILEXECUTOR=&DRIVER=&TESTS_TO_RUN=<casos>` con Basic Auth (`jenkins.username`/`jenkins.pass`). `POST /jenkins/status` consulta `.../api/json?tree=name,lastBuild[displayName,duration,result,timestamp]` y devuelve estado por pipeline (`PROCESSING` mientras `result` es null).
+
+**Qué significa esto para ti al construir/ejecutar un bot:** para que `/execute/{suiteId}` funcione deben existir (1) Capabilities activas, (2) la suite en `AUT_SUITE` y (3) su `SuiteExecutionConfig` con `botConfig` apuntando a tu `gitRepo`/`gitBranch`/`suiteFile` reales y los secretos declarados por nombre. Un fallo de ejecución desde el front suele ser de **configuración** (404/422 del backend o 502 del webhook), no del robot; distínguelo antes de tocar el código.
+
 ### Ejecución del bot
 - **Local / bajo demanda**: `./gradlew test`, o con suite específica `./gradlew test -PsuiteFile=suite.xml`. Requisitos previos: variables de entorno (`dev_environment_variables`), credenciales de Google y elementos registrados en SmartBot para el ambiente.
-- **Desde el frontend (autobol-automation-frontend)**: la ejecución se dispara por dos vías:
-  - **Jenkins** (`JenkinsService`): el frontend postea `jobName`/`pipeline`, `nameDriver` y `testsToExecute` al backend de métricas; el estado se consulta por `jenkinsStatus`.
-  - **Orquestador n8n** (`ExecutionConfigService.executeSuite`): el backend construye el `ExecutionPayload` (`parameterStore`, `infrastructure`, `bot {type, gitRepo, gitBranch, suiteFile, name, fileSubstitution}`, `notifications`, `secrets {names, mapping}`, `envVars`) y hace el POST al webhook (Basic Auth del lado servidor).
+- **Desde el frontend (SmartBot — `autobol-automation-frontend`)**: la suite se registra/configura y luego se dispara por **Jenkins** (`POST /jenkins/execute`) o por el **orquestador n8n** (`POST /execution-config/execute/{suiteId}`, el backend arma el `ExecutionPayload` y postea al webhook). Ver la sección **"El frontend de automatización (SmartBot)"** para el detalle de servicios, endpoints, ciclo de vida de la suite y el contrato del webhook n8n.
 - **Verificación de la corrida**: revisar reporte Allure (`allure-results`), logs (`autobol-app-*.log`), `execution_id.txt`, el estado escrito en el Sheet y el movimiento del archivo en Drive.
 
 ### Calidad de código y pruebas
